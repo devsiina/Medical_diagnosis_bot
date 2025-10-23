@@ -1,0 +1,6 @@
+python-telegram-bot==20.8
+pandas
+openpyxl
+reportlab
+python-dotenv
+rapidfuzz  # optional, speeds up fuzzy matching (remove if you don't want it)
