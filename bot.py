@@ -1,77 +1,81 @@
 #!/usr/bin/env python3
 """
-Telegram Symptom-Checker Bot (HTTP polling, stdlib)
-- Uses Telegram Bot API directly (no python-telegram-bot).
-- Loads CSV datasets from dataset/ (pure stdlib csv).
-- Generates PDF reports with reportlab and sends via sendDocument.
-- Use as a single-process Background Worker on Render (replicas=1).
+Simple Telegram Symptom-Checker Bot (single-file)
+
+Requirements (put in requirements.txt):
+python-telegram-bot==20.8
+reportlab
+
+Notes:
+- This script uses only python-telegram-bot for Telegram interactions.
+- It uses stdlib csv to load dataset/ CSV files.
+- Runs with Application.run_polling().
+- Keep instance count = 1 on Render when using polling (or deploy as Background Worker).
 """
 
 import os
-import sys
-import time
 import csv
 import ast
-import json
 import logging
-import mimetypes
-import urllib.parse
-import urllib.request
-import io
 from datetime import datetime, timezone
+from typing import List, Dict
+from io import BytesIO
 
-# PDF generation (external package)
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+# PDF generator
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
-# ---------- CONFIG ----------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    print("ERROR: TELEGRAM_TOKEN environment variable not set.", file=sys.stderr)
-    sys.exit(1)
+# -------------- CONFIG --------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # set in Render env
+DATA_DIR = os.getenv("DATA_DIR", "dataset")
+# Expected CSV filenames inside DATA_DIR:
+TRAINING_CSV = os.path.join(DATA_DIR, "Training.csv")
+SYMPTOMS_DF_CSV = os.path.join(DATA_DIR, "symptoms_df.csv")
+DESCRIPTION_CSV = os.path.join(DATA_DIR, "description.csv")
+MEDICATIONS_CSV = os.path.join(DATA_DIR, "medications.csv")
+DIETS_CSV = os.path.join(DATA_DIR, "diets.csv")
+WORKOUT_CSV = os.path.join(DATA_DIR, "workout_df.csv")
+PRECAUTIONS_CSV = os.path.join(DATA_DIR, "precautions_df.csv")
+SYMPTOM_SEVERITY_CSV = os.path.join(DATA_DIR, "Symptom-severity.csv")
 
-API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-KB_DIR = os.getenv("KB_DIR", "dataset")
-KB_PATHS = {
-    "training": os.path.join(KB_DIR, "Training.csv"),
-    "symptoms_df": os.path.join(KB_DIR, "symptoms_df.csv"),
-    "description": os.path.join(KB_DIR, "description.csv"),
-    "medications": os.path.join(KB_DIR, "medications.csv"),
-    "diets": os.path.join(KB_DIR, "diets.csv"),
-    "workout": os.path.join(KB_DIR, "workout_df.csv"),
-    "precautions": os.path.join(KB_DIR, "precautions_df.csv"),
-    "severity": os.path.join(KB_DIR, "Symptom-severity.csv"),
-}
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))  # seconds between getUpdates
-LOG_FILE = os.getenv("LOG_FILE", None)  # optional file path
-# --------------------------------
+MIN_CONFIDENCE = 25
+TOP_N = 5
+EMERGENCY_KEYWORDS = [
+    "chest pain", "difficulty breathing", "shortness of breath",
+    "severe bleeding", "unconscious", "loss of consciousness",
+    "sudden weakness", "sudden numbness", "slurred speech"
+]
+# ------------------------------------
 
-# ---------- Logging ----------
-logger = logging.getLogger("symptom_bot")
-logger.setLevel(logging.INFO)
-fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-h = logging.StreamHandler(sys.stdout)
-h.setFormatter(fmt)
-logger.addHandler(h)
-if LOG_FILE:
-    fh = logging.FileHandler(LOG_FILE)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
+# -------------- LOGGING --------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+# ------------------------------------
 
-# ---------- Utilities ----------
+# -------------- UTILITIES --------------
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-def normalize(s):
+def normalize(s: str) -> str:
     if s is None:
         return ""
-    s = str(s).strip().lower()
-    s = "".join(ch for ch in s if ch.isalnum() or ch.isspace() or ch == "-")
-    s = " ".join(s.split())
-    return s
+    t = str(s).strip().lower()
+    t = "".join(ch for ch in t if ch.isalnum() or ch.isspace() or ch == "-")
+    return " ".join(t.split())
 
-def parse_possible_list_field(cell):
-    """Parse "['a','b']" or "a, b, c" into list of strings."""
+def parse_list_like(cell):
+    """Parse cells like "['a','b']" or "a, b, c" into list[str]."""
     if cell is None:
         return []
     if isinstance(cell, (list, tuple)):
@@ -81,178 +85,185 @@ def parse_possible_list_field(cell):
         return []
     if s.startswith("[") and s.endswith("]"):
         try:
-            parsed = ast.literal_eval(s)
-            if isinstance(parsed, (list, tuple)):
-                return [str(x).strip() for x in parsed if str(x).strip()]
+            v = ast.literal_eval(s)
+            if isinstance(v, (list, tuple)):
+                return [str(x).strip() for x in v if str(x).strip()]
         except Exception:
             pass
-    # fallback: split by comma/semicolon
     parts = [p.strip() for p in s.split(",") if p.strip()]
     return parts
 
-# ---------- CSV loaders (pure stdlib) ----------
-def load_csv_rows(path):
+def read_csv_rows(path):
     rows = []
-    if not os.path.exists(path):
-        logger.warning("CSV not found: %s", path)
-        return rows
     try:
         with open(path, newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             for r in reader:
-                # ensure r is dict
+                # ensure dict
                 if not isinstance(r, dict):
                     r = dict(zip(reader.fieldnames or [], list(r)))
                 rows.append(r)
+    except FileNotFoundError:
+        logger.warning("CSV not found: %s", path)
     except Exception as e:
-        logger.exception("Failed to load CSV %s: %s", path, e)
+        logger.exception("Error reading CSV %s: %s", path, e)
     return rows
+# ---------------------------------------
 
+# -------------- KB LOAD --------------
 def build_kb():
-    logger.info("Loading KB files from %s", KB_DIR)
-    kb = {}
-    for k, p in KB_PATHS.items():
-        kb[k] = load_csv_rows(p)
-        logger.info("Loaded %d rows from %s", len(kb[k]), p)
-    # Build convenient maps
-    # training mapping: disease_norm -> set(symptom_norm) from Training.csv (assumes presence of many symptom columns)
+    logger.info("Loading CSV datasets from %s", DATA_DIR)
+    training_rows = read_csv_rows(TRAINING_CSV)
+    symptoms_rows = read_csv_rows(SYMPTOMS_DF_CSV)
+    desc_rows = read_csv_rows(DESCRIPTION_CSV)
+    meds_rows = read_csv_rows(MEDICATIONS_CSV)
+    diets_rows = read_csv_rows(DIETS_CSV)
+    workout_rows = read_csv_rows(WORKOUT_CSV)
+    prec_rows = read_csv_rows(PRECAUTIONS_CSV)
+    severity_rows = read_csv_rows(SYMPTOM_SEVERITY_CSV)
+
+    # Build disease -> symptoms from Training.csv (assumes many symptom columns + final disease column)
     training_map = {}
-    for row in kb.get("training", []):
+    for row in training_rows:
         # detect disease column heuristically
-        disease = None
-        for candidate in ("prognosis", "diagnosis", "disease", "label"):
-            if candidate in (c.lower() for c in row.keys()):
-                disease = row.get(next(c for c in row.keys() if c.lower() == candidate))
+        disease_val = None
+        for candidate in ("prognosis", "diagnosis", "disease", "diseases", "label"):
+            for col in row.keys():
+                if col and col.lower() == candidate:
+                    disease_val = row.get(col)
+                    break
+            if disease_val:
                 break
-        if not disease:
-            # fallback: last non-empty value
+        if not disease_val:
+            # fallback: last column value
             vals = [v for v in row.values() if v is not None and str(v).strip() != ""]
-            if vals:
-                disease = vals[-1]
-        if not disease:
+            disease_val = vals[-1] if vals else None
+        if not disease_val:
             continue
-        dnorm = normalize(disease)
-        if dnorm not in training_map:
-            training_map[dnorm] = set()
-        # symptoms columns: assume all columns except disease column; if header value '1' => symptom present
+        dnorm = normalize(disease_val)
+        training_map.setdefault(dnorm, set())
+        # assume symptom columns flagged with 1
         for col, val in row.items():
             if col is None:
                 continue
-            # skip if this column's value equals the disease value (heuristic)
-            if str(val).strip().lower() == str(disease).strip().lower():
+            if val is None:
                 continue
-            if str(val).strip() in ("1", "1.0", "true", "yes"):
+            sval = str(val).strip().lower()
+            if sval in ("1", "true", "yes", "y"):
                 training_map[dnorm].add(normalize(col))
-    # symptoms_df mapping: Disease -> symptom columns (Symptom_1..)
+
+    # Build from symptoms_df.csv (Disease, Symptom_1..Symptom_4)
     symptoms_map = {}
-    for row in kb.get("symptoms_df", []):
-        # find disease value
-        dval = None
-        for key in row.keys():
-            if key and key.lower() == "disease":
-                dval = row.get(key)
-                break
-        if not dval:
-            # try first column
-            dval = next(iter(row.values()), None)
+    for row in symptoms_rows:
+        dval = row.get("Disease") or row.get("disease") or next(iter(row.values()), None)
         if not dval:
             continue
         dnorm = normalize(dval)
-        if dnorm not in symptoms_map:
-            symptoms_map[dnorm] = set()
-        for col, val in row.items():
-            if col and col.lower().startswith("symptom") and val and str(val).strip():
+        symptoms_map.setdefault(dnorm, set())
+        for key, val in row.items():
+            if key and key.lower().startswith("symptom") and val and str(val).strip():
                 symptoms_map[dnorm].add(normalize(val))
-    # merge training_map and symptoms_map
+
+    # merge maps
     disease_to_symptoms = {}
     for d, sset in training_map.items():
         disease_to_symptoms[d] = set(sset)
     for d, sset in symptoms_map.items():
         disease_to_symptoms.setdefault(d, set()).update(sset)
-    # parse description, meds, diets, workouts, precautions maps keyed by normalized disease
+
+    # description map
     description_map = {}
-    for row in kb.get("description", []):
-        # look for Disease column
+    for row in desc_rows:
         dval = row.get("Disease") or row.get("disease") or next(iter(row.values()), None)
         if not dval:
             continue
-        description_map[normalize(dval)] = " ".join([str(v).strip() for k, v in row.items() if k and k.lower() != "disease" and v])
+        dnorm = normalize(dval)
+        # join other columns
+        parts = []
+        for k, v in row.items():
+            if k and k.lower() != "disease" and v and str(v).strip():
+                parts.append(str(v).strip())
+        description_map[dnorm] = " ".join(parts) if parts else ""
+
+    # meds
     meds_map = {}
-    for row in kb.get("medications", []):
+    for row in meds_rows:
         dval = row.get("Disease") or row.get("disease") or next(iter(row.values()), None)
         if not dval:
             continue
-        med = ""
-        # find a meds column
+        dnorm = normalize(dval)
+        med = None
         for k, v in row.items():
             if v and "med" in (k or "").lower():
                 med = v
                 break
-        meds_map.setdefault(normalize(dval), []).append(med) if med else None
+        if med:
+            meds_map.setdefault(dnorm, []).append(str(med).strip())
+
+    # diets: parse list-like strings
     diets_map = {}
-    for row in kb.get("diets", []):
+    for row in diets_rows:
         dval = row.get("Disease") or row.get("disease") or next(iter(row.values()), None)
         if not dval:
             continue
-        # find diet column heuristically
-        diet_val = ""
+        dnorm = normalize(dval)
+        diet_cell = None
         for k, v in row.items():
             if v and "diet" in (k or "").lower():
-                diet_val = v
+                diet_cell = v
                 break
-        if not diet_val:
-            # try any non-empty value except disease
-            for k, v in row.items():
-                if v and (k.lower() != "disease"):
-                    diet_val = v
-                    break
-        parsed = parse_possible_list_field(diet_val)
-        if parsed:
-            diets_map[normalize(dval)] = parsed
-    workout_map = {}
-    for row in kb.get("workout", []):
-        dval = row.get("Disease") or row.get("disease") or next(iter(row.values()), None)
-        if not dval:
-            continue
-        w = ""
-        for k, v in row.items():
-            if v and ("work" in (k or "").lower() or "workout" in (k or "").lower() or "exercise" in (k or "").lower()):
-                w = v
-                break
-        if w:
-            workout_map[normalize(dval)] = str(w)
-    precautions_map = {}
-    for row in kb.get("precautions", []):
-        dval = row.get("Disease") or row.get("disease") or next(iter(row.values()), None)
-        if not dval:
-            continue
-        p_list = []
-        for k, v in row.items():
-            if k and k.lower().startswith("precaution") and v and str(v).strip():
-                p_list.append(str(v).strip())
-        if not p_list:
-            # try any non-empty columns except disease
+        if not diet_cell:
+            # fallback to any non-empty non-disease value
             for k, v in row.items():
                 if k and k.lower() != "disease" and v and str(v).strip():
-                    p_list.append(str(v).strip())
-        if p_list:
-            precautions_map[normalize(dval)] = p_list
+                    diet_cell = v
+                    break
+        parsed = parse_list_like(diet_cell)
+        if parsed:
+            diets_map[dnorm] = parsed
+
+    # workouts
+    workout_map = {}
+    for row in workout_rows:
+        dval = row.get("Disease") or row.get("disease") or next(iter(row.values()), None)
+        if not dval:
+            continue
+        dnorm = normalize(dval)
+        wval = None
+        for k, v in row.items():
+            if v and ("work" in (k or "").lower() or "exercise" in (k or "").lower()):
+                wval = v
+                break
+        if wval:
+            workout_map[dnorm] = str(wval).strip()
+
+    # precautions
+    precautions_map = {}
+    for row in prec_rows:
+        dval = row.get("Disease") or row.get("disease") or next(iter(row.values()), None)
+        if not dval:
+            continue
+        dnorm = normalize(dval)
+        precs = []
+        for k, v in row.items():
+            if k and k.lower().startswith("precaution") and v and str(v).strip():
+                precs.append(str(v).strip())
+        if not precs:
+            for k, v in row.items():
+                if k and k.lower() != "disease" and v and str(v).strip():
+                    precs.append(str(v).strip())
+        if precs:
+            precautions_map[dnorm] = precs
+
     # symptom weights
     symptom_weights = {}
-    for row in kb.get("severity", []):
-        # detect symptom & weight columns
-        sym_col = None
-        wt_col = None
-        for k in row.keys():
-            if k and "symptom" in k.lower():
-                sym_col = k
-            if k and (k.lower() in ("weight", "severity", "value")):
-                wt_col = k
-        # fallback
-        if not sym_col and row and len(row) >= 1:
-            sym_col = next(iter(row.keys()))
-        if not wt_col and row and len(row) >= 2:
-            wt_col = list(row.keys())[1]
+    for row in severity_rows:
+        # find symptom & weight columns heuristically
+        sym_col = next((k for k in row.keys() if k and "symptom" in k.lower()), None)
+        wt_col = next((k for k in row.keys() if k and k.lower() in ("weight", "severity", "value")), None)
+        if not sym_col:
+            # fallback first column
+            sym_col = next(iter(row.keys()), None)
         if not sym_col:
             continue
         s = row.get(sym_col)
@@ -265,183 +276,121 @@ def build_kb():
             symptom_weights[normalize(s)] = wf
     # normalize weights
     if symptom_weights:
-        m = max(symptom_weights.values())
-        if m > 0:
+        max_w = max(symptom_weights.values())
+        if max_w > 0:
             for k in list(symptom_weights.keys()):
-                symptom_weights[k] = symptom_weights[k] / m
-    logger.info("KB built: %d diseases, %d symptom weights", len(disease_to_symptoms), len(symptom_weights))
-    return {
-        "disease_to_symptoms": {k: list(v) for k, v in disease_to_symptoms.items()},
+                symptom_weights[k] = symptom_weights[k] / max_w
+
+    # turn sets into lists for JSON safety
+    disease_to_symptoms = {k: list(v) for k, v in disease_to_symptoms.items()}
+
+    kb = {
+        "disease_to_symptoms": disease_to_symptoms,
         "description_map": description_map,
         "meds_map": meds_map,
         "diets_map": diets_map,
         "workout_map": workout_map,
         "precautions_map": precautions_map,
-        "symptom_weights": symptom_weights
+        "symptom_weights": symptom_weights,
     }
+    logger.info("KB loaded: %d diseases", len(disease_to_symptoms))
+    return kb
 
 KB = build_kb()
+# --------------------------------------
 
-# ---------- Telegram HTTP helpers (stdlib) ----------
-def api_post_json(method, data):
-    url = f"{API_BASE}/{method}"
-    data_bytes = json.dumps(data).encode("utf-8")
-    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.load(resp)
-
-def api_get(method, params=None):
-    url = f"{API_BASE}/{method}"
-    if params:
-        url = url + "?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=60) as resp:
-        return json.load(resp)
-
-def send_message(chat_id, text, parse_mode=None):
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    try:
-        api_post_json("sendMessage", payload)
-    except Exception as e:
-        logger.exception("send_message failed: %s", e)
-
-def send_document(chat_id, file_path, filename=None):
-    """Send a file via multipart/form-data using urllib (stdlib)."""
-    url = f"{API_BASE}/sendDocument"
-    boundary = "----WebKitFormBoundary" + str(int(time.time() * 1000))
-    if not filename:
-        filename = os.path.basename(file_path)
-    # read file bytes
-    with open(file_path, "rb") as fh:
-        file_bytes = fh.read()
-    # build multipart body
-    crlf = b"\r\n"
-    body = []
-    # chat_id field
-    body.append(b"--" + boundary.encode("utf-8"))
-    body.append(b'Content-Disposition: form-data; name="chat_id"')
-    body.append(b"")
-    body.append(str(chat_id).encode("utf-8"))
-    # document file field
-    body.append(b"--" + boundary.encode("utf-8"))
-    disposition = f'Content-Disposition: form-data; name="document"; filename="{filename}"'
-    body.append(disposition.encode("utf-8"))
-    ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    body.append(f"Content-Type: {ctype}".encode("utf-8"))
-    body.append(b"")
-    body.append(file_bytes)
-    # end
-    body.append(b"--" + boundary.encode("utf-8") + b"--")
-    body.append(b"")
-    body_bytes = crlf.join(body)
-    headers = {
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
-        "Content-Length": str(len(body_bytes))
-    }
-    req = urllib.request.Request(url, data=body_bytes, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.load(resp)
-    except Exception as e:
-        logger.exception("send_document failed: %s", e)
-        return None
-
-# ---------- Simple scoring & analysis ----------
-def score_diseases(user_symptoms, user_severities):
-    """
-    Very simple scoring:
-    - For each disease, count how many normalized symptoms match disease symptom list (substring/fuzzy naive)
-    - Weight by severity and symptom weight if available
-    - Return sorted list
-    """
-    user_norms = [normalize(s) for s in user_symptoms]
-    results = []
-    for disease, dsym_list in KB["disease_to_symptoms"].items():
-        dsym_norms = [normalize(s) for s in dsym_list]
-        raw = 0.0
-        matches = []
-        for us, sev in zip(user_norms, user_severities):
-            best = 0.0
-            best_sym = None
-            for ds in dsym_norms:
-                # simple substring / fuzzy via ratio
-                if us == ds or us in ds or ds in us:
-                    score = 1.0
-                else:
-                    # use simple character ratio
-                    score = char_ratio(us, ds)
-                if score > best:
-                    best = score
-                    best_sym = ds
-            if best > 0.3:
-                weight = KB["symptom_weights"].get(us, KB["symptom_weights"].get(best_sym, 1.0))
-                raw += (sev / 5.0) * best * weight
-                matches.append((best_sym, best))
-        # normalize by number of user symptoms
-        max_possible = sum((s/5.0) for s in user_severities) or 1.0
-        percent = int((raw / max_possible) * 100)
-        results.append({"disease": disease, "score": percent, "raw": raw, "matches": matches})
-    results.sort(key=lambda r: (-r["score"], -r["raw"]))
-    return results
-
-def char_ratio(a, b):
-    # cheap similarity: longest common subsequence ratio via SequenceMatcher
+# -------------- Matching & Scoring --------------
+def simple_similarity(a: str, b: str) -> float:
+    """Cheap similarity via SequenceMatcher ratio (0..1)."""
     try:
         from difflib import SequenceMatcher
         return SequenceMatcher(None, a, b).ratio()
     except Exception:
-        # fallback
         return 0.0
 
-# ---------- PDF generation ----------
-def create_pdf(disease, desc, meds, diets, workouts, precautions, symptoms):
-    fname = f"diagnosis_{disease.replace(' ', '_')}_{int(time.time())}.pdf"
-    c = canvas.Canvas(fname, pagesize=A4)
+def score_diseases(user_symptoms: List[str], severities: List[float]) -> List[Dict]:
+    user_norms = [normalize(s) for s in user_symptoms]
+    results = []
+    for disease, dsym_list in KB["disease_to_symptoms"].items():
+        ds_norms = [normalize(s) for s in dsym_list]
+        raw = 0.0
+        matches = []
+        for us_norm, sev in zip(user_norms, severities):
+            best = 0.0
+            best_sym = None
+            for ds in ds_norms:
+                # exact/substr check
+                if us_norm == ds or us_norm in ds or ds in us_norm:
+                    score = 1.0
+                else:
+                    score = simple_similarity(us_norm, ds)
+                if score > best:
+                    best = score
+                    best_sym = ds
+            if best >= 0.3:
+                w = KB["symptom_weights"].get(us_norm, KB["symptom_weights"].get(best_sym, 1.0))
+                raw += (sev / 5.0) * best * w
+                matches.append((best_sym, round(best, 2)))
+        max_possible = sum((s / 5.0) for s in severities) or 1.0
+        percent = int((raw / max_possible) * 100)
+        results.append({"disease": disease, "score_percent": percent, "raw": raw, "matches": matches})
+    results.sort(key=lambda r: (-r["score_percent"], -r["raw"]))
+    return results
+# ------------------------------------------
+
+# -------------- PDF Generation --------------
+def generate_pdf_bytes(disease, desc, meds, diets, workouts, precs, symptoms):
+    """Return BytesIO containing generated PDF."""
+    bio = BytesIO()
+    c = canvas.Canvas(bio, pagesize=A4)
     width, height = A4
     y = height - 50
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, y, f"Diagnosis Report — {disease}")
-    y -= 25
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, y, f"Diagnosis Report — {disease.title()}")
+    y -= 28
     c.setFont("Helvetica", 10)
     c.drawString(50, y, f"Generated: {now_iso()}")
-    y -= 20
+    y -= 18
     c.drawString(50, y, f"Symptoms: {', '.join(symptoms)}")
-    y -= 30
+    y -= 20
     if desc:
-        c.setFont("Helvetica-Bold", 12); c.drawString(50, y, "Description:"); y -= 16
-        c.setFont("Helvetica", 10); text = c.beginText(50, y)
-        for line in split_text(desc, 80):
-            text.textLine(line); y -= 12
-        c.drawText(text)
-        y = text.getY() - 10
+        c.setFont("Helvetica-Bold", 12); c.drawString(50, y, "Description:"); y -= 14
+        c.setFont("Helvetica", 10)
+        for line in wrap_text(desc, 90):
+            c.drawString(55, y, line); y -= 12
     if meds:
-        c.setFont("Helvetica-Bold", 12); c.drawString(50, y, "Medications:"); y -= 16
+        y -= 6
+        c.setFont("Helvetica-Bold", 12); c.drawString(50, y, "Medications:"); y -= 14
         c.setFont("Helvetica", 10)
         for m in meds:
             c.drawString(60, y, f"- {m}"); y -= 12
     if diets:
-        c.setFont("Helvetica-Bold", 12); c.drawString(50, y, "Diet suggestions:"); y -= 16
+        y -= 6
+        c.setFont("Helvetica-Bold", 12); c.drawString(50, y, "Diet Suggestions:"); y -= 14
         c.setFont("Helvetica", 10)
         for d in diets:
             c.drawString(60, y, f"- {d}"); y -= 12
     if workouts:
-        c.setFont("Helvetica-Bold", 12); c.drawString(50, y, "Workouts:"); y -= 16
+        y -= 6
+        c.setFont("Helvetica-Bold", 12); c.drawString(50, y, "Workouts:"); y -= 14
         c.setFont("Helvetica", 10)
         c.drawString(60, y, str(workouts)); y -= 14
-    if precautions:
-        c.setFont("Helvetica-Bold", 12); c.drawString(50, y, "Precautions:"); y -= 16
+    if precs:
+        y -= 6
+        c.setFont("Helvetica-Bold", 12); c.drawString(50, y, "Precautions:"); y -= 14
         c.setFont("Helvetica", 10)
-        for p in precautions:
+        for p in precs:
             c.drawString(60, y, f"- {p}"); y -= 12
-    y -= 20
+    y -= 10
     c.setFont("Helvetica-Oblique", 9)
-    c.drawString(50, y, "Disclaimer: educational only — not a medical diagnosis.")
+    c.drawString(50, y, "Disclaimer: This report is educational only and not a professional diagnosis.")
+    c.showPage()
     c.save()
-    return fname
+    bio.seek(0)
+    return bio
 
-def split_text(s, width):
-    words = s.split()
+def wrap_text(text, width):
+    words = text.split()
     lines = []
     cur = []
     cur_len = 0
@@ -453,158 +402,169 @@ def split_text(s, width):
     if cur:
         lines.append(" ".join(cur))
     return lines
+# ------------------------------------------
 
-# ---------- Conversation management ----------
-# Minimal in-memory state: user_id -> dict with keys: step, guess, confidence, symptoms (list), severities (list)
-SESSIONS = {}
+# -------------- Handlers & Flow --------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.user_data["state"] = "ask_guess"
+    await update.message.reply_text(
+        "Hello — I'm an educational symptom helper.\n"
+        "Do you have a guess what disease you might have? Reply yes/no."
+    )
 
-def reset_session(user_id):
-    SESSIONS[user_id] = {"step": "start", "guess": "", "confidence": 0, "symptoms": [], "severities": []}
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Send symptoms in a message (comma-separated) or follow the interactive prompts. Use /start to begin.")
 
-# ---------- Update processing ----------
-def handle_update(u):
-    """Process a single Telegram update dict."""
-    if "message" not in u:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    uid = update.effective_user.id
+    state = context.user_data.get("state")
+
+    # if no state, start
+    if state is None:
+        context.user_data["state"] = "ask_guess"
+        await update.message.reply_text("Do you have a guess? (yes/no)")
         return
-    m = u["message"]
-    chat = m.get("chat", {})
-    chat_id = chat.get("id")
-    user = m.get("from", {})
-    user_id = user.get("id")
-    text = m.get("text", "")
-    if not text:
-        return
-    text_stripped = text.strip()
-    if user_id not in SESSIONS:
-        reset_session(user_id)
-        send_message(chat_id, "Hi — welcome to the Symptom Checker (prototype). Do you have a guess about your illness? (yes/no)")
-        SESSIONS[user_id]["step"] = "awaiting_guess_answer"
-        return
-    session = SESSIONS[user_id]
-    step = session["step"]
 
-    # flow
-    if step == "awaiting_guess_answer":
-        if text_stripped.lower().startswith("y"):
-            session["step"] = "ask_guess"
-            send_message(chat_id, "Okay — what disease do you think you have?")
-            return
+    # Ask guess?
+    if state == "ask_guess":
+        if text.lower().startswith("y"):
+            context.user_data["state"] = "await_guess_text"
+            await update.message.reply_text("What disease do you think you have? (write name)")
         else:
-            session["step"] = "ask_symptoms"
-            send_message(chat_id, "Please list your symptoms, separated by commas (e.g., fever, cough).")
-            return
-    if step == "ask_guess":
-        session["guess"] = text_stripped
-        session["step"] = "ask_confidence"
-        send_message(chat_id, "How sure are you? Enter a percentage 0-100.")
+            context.user_data["state"] = "ask_symptoms"
+            await update.message.reply_text("Please list your symptoms (comma-separated).")
         return
-    if step == "ask_confidence":
+
+    if state == "await_guess_text":
+        context.user_data["guess"] = text
+        context.user_data["state"] = "ask_confidence"
+        await update.message.reply_text("How sure are you (0-100)?")
+        return
+
+    if state == "ask_confidence":
         try:
-            conf = float(text_stripped)
-            session["confidence"] = max(0, min(100, conf))
+            conf = float(text)
         except Exception:
-            session["confidence"] = 50.0
-        session["step"] = "ask_symptoms"
-        send_message(chat_id, "Now, please list your symptoms (comma-separated).")
+            conf = 50.0
+        context.user_data["guess_confidence"] = max(0.0, min(100.0, conf))
+        context.user_data["state"] = "ask_symptoms"
+        await update.message.reply_text("Now list your symptoms (comma-separated).")
         return
-    if step == "ask_symptoms":
-        parts = [p.strip() for p in text_stripped.split(",") if p.strip()]
-        session["symptoms"] = parts
-        session["severities"] = []
+
+    if state == "ask_symptoms":
+        parts = [p.strip() for p in text.split(",") if p.strip()]
         if not parts:
-            send_message(chat_id, "Please provide at least one symptom.")
+            await update.message.reply_text("Please provide at least one symptom.")
             return
-        session["step"] = "ask_severity_index"
-        session["severity_index"] = 0
-        send_message(chat_id, f"Rate severity (1-5) for: {parts[0]}")
+        context.user_data["symptoms"] = parts
+        context.user_data["severities"] = []
+        context.user_data["sev_index"] = 0
+        context.user_data["state"] = "ask_severity"
+        await update.message.reply_text(f"Rate severity (1-5) for: {parts[0]}")
         return
-    if step == "ask_severity_index":
-        # record severity for current symptom
+
+    if state == "ask_severity":
+        # record
         try:
-            v = float(text_stripped)
-            if v < 1: v = 1
-            if v > 5: v = 5
+            v = float(text)
         except Exception:
             v = 3.0
-        idx = session.get("severity_index", 0)
-        session["severities"].append(v)
-        idx += 1
-        if idx < len(session["symptoms"]):
-            session["severity_index"] = idx
-            send_message(chat_id, f"Rate severity (1-5) for: {session['symptoms'][idx]}")
+        v = max(1.0, min(5.0, v))
+        context.user_data["severities"].append(v)
+        idx = context.user_data["sev_index"] + 1
+        parts = context.user_data["symptoms"]
+        if idx < len(parts):
+            context.user_data["sev_index"] = idx
+            await update.message.reply_text(f"Rate severity (1-5) for: {parts[idx]}")
             return
-        # all severities collected -> analyze
-        session["step"] = "analysis_done"
-        results = score_diseases(session["symptoms"], session["severities"])
-        # build reply
+        # done collecting severities -> analyze
+        results = score_diseases(context.user_data["symptoms"], context.user_data["severities"])
+        context.user_data["results"] = results
+        # triage check
+        joined = " ".join(context.user_data["symptoms"]).lower()
+        triage_msg = ""
+        if any(k in joined for k in EMERGENCY_KEYWORDS):
+            triage_msg = "⚠️ Possible emergency symptom detected — seek urgent care."
+        # send top results
         if not results:
-            send_message(chat_id, "No matches found in KB.")
-            reset_session(user_id)
+            await update.message.reply_text("No matches found in the knowledge base.")
+            context.user_data.clear()
             return
-        # prepare top results text
-        top_texts = []
-        topn = results[:5]
-        for r in topn:
-            top_texts.append(f"{r['disease'].title()} — {r['score']}%")
-        reply = "Top possible conditions:\n" + "\n".join(top_texts)
-        reply += "\n\nReply 'pdf' to receive a PDF report of the top result, or 'no' to finish."
-        send_message(chat_id, reply)
-        # store top result in session
-        session["top_results"] = results
+        msg_lines = [f"*Top {min(TOP_N, len(results))} possible conditions:*"]
+        for r in results[:TOP_N]:
+            msg_lines.append(f"- *{r['disease'].title()}* — Confidence: {r['score_percent']}%")
+        if results[0]["score_percent"] < MIN_CONFIDENCE:
+            msg_lines.append("\n⚠️ Low confidence — consider giving more symptoms.")
+        if triage_msg:
+            msg_lines.append("\n" + triage_msg)
+        # keyboard to get PDF or refine
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Get PDF report", callback_data="get_pdf"),
+            InlineKeyboardButton("Refine", callback_data="refine"),
+            InlineKeyboardButton("Done", callback_data="done")
+        ]])
+        await update.message.reply_text("\n".join(msg_lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        context.user_data["state"] = "done"
         return
-    if step == "analysis_done":
-        if text_stripped.lower() in ("pdf", "yes", "y"):
-            top = session.get("top_results", [])
-            if not top:
-                send_message(chat_id, "No analysis to generate PDF from.")
-                reset_session(user_id)
-                return
-            top0 = top[0]
-            disease = top0["disease"]
-            desc = KB["description_map"].get(disease, "")
-            meds = KB["meds_map"].get(disease, [])
-            diets = KB["diets_map"].get(disease, [])
-            workouts = KB["workout_map"].get(disease, "")
-            precs = KB["precautions_map"].get(disease, [])
-            pdf_path = create_pdf(disease, desc, meds, diets, workouts, precs, session.get("symptoms", []))
-            send_message(chat_id, f"Sending PDF report for {disease} — this is educational only.")
-            send_document(chat_id, pdf_path, filename=os.path.basename(pdf_path))
-            try:
-                os.remove(pdf_path)
-            except Exception:
-                pass
-            reset_session(user_id)
-            return
-        else:
-            send_message(chat_id, "Okay — finished. If you want another analysis, send any message.")
-            reset_session(user_id)
-            return
 
-# ---------- Polling loop ----------
-def main_loop():
-    offset = None
-    logger.info("Starting polling loop...")
-    while True:
-        try:
-            params = {"timeout": 30}
-            if offset:
-                params["offset"] = offset
-            resp = api_get("getUpdates", params=params)
-            if not resp.get("ok"):
-                logger.warning("getUpdates not ok: %s", resp)
-                time.sleep(POLL_INTERVAL)
-                continue
-            updates = resp.get("result", [])
-            for u in updates:
-                # process update
-                handle_update(u)
-                offset = u["update_id"] + 1
-        except Exception as e:
-            logger.exception("Polling loop error: %s", e)
-            time.sleep(5)
+    # done state messages
+    if state == "done":
+        await update.message.reply_text("If you want to start again, send /start.")
+        return
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "refine":
+        context.user_data["state"] = "ask_symptoms"
+        await query.edit_message_text("Okay — send additional symptoms or clarify existing ones (comma-separated).")
+        return
+    if data == "done":
+        context.user_data.clear()
+        await query.edit_message_text("Okay — session ended. Use /start to run again.")
+        return
+    if data == "get_pdf":
+        res = context.user_data.get("results")
+        if not res:
+            await query.edit_message_text("No analysis to generate PDF from. Run /start first.")
+            return
+        top = res[0]
+        disease = top["disease"]
+        desc = KB["description_map"].get(disease, "")
+        meds = KB["meds_map"].get(disease, [])
+        diets = KB["diets_map"].get(disease, [])
+        workouts = KB["workout_map"].get(disease, "")
+        precs = KB["precautions_map"].get(disease, [])
+        symptoms = context.user_data.get("symptoms", [])
+        bio = generate_pdf_bytes(disease, desc, meds, diets, workouts, precs, symptoms)
+        bio.name = f"diagnosis_{disease}.pdf"
+        await context.bot.send_document(chat_id=query.message.chat_id, document=InputFile(bio, filename=bio.name), caption="Diagnosis PDF (educational only).")
+        await query.edit_message_text("PDF sent. Use /start to analyze another case.")
+        context.user_data.clear()
+        return
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Exception in handler: %s", context.error)
+# ---------------------------------------
+
+# -------------- MAIN --------------
+def main():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Set TELEGRAM_TOKEN environment variable before running.")
+    # Build application
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_error_handler(error_handler)
+
+    logger.info("Bot started (polling).")
+    app.run_polling()
 
 if __name__ == "__main__":
-    try:
-        main_loop()
-    except KeyboardInterrupt:
-        logger.info("Shutting down (KeyboardInterrupt).")
+    main()
