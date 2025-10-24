@@ -1,278 +1,191 @@
-"""
-Telegram Illness Prediction Bot (Render Deployment-Ready)
-Educational Prototype — not a medical diagnostic tool.
-"""
-
 import os
 import csv
-import ast
-import logging
-from datetime import datetime, timezone
+from datetime import datetime, UTC
+from io import BytesIO
 from telegram import Update, InputFile
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, filters, ContextTypes
 
-# ============= CONFIG =============
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # Set this in Render Environment
-KB_PATHS = [
-    "dataset/Training.csv",
-    "dataset/symptoms_df.csv",
-    "dataset/description.csv",
-    "dataset/medications.csv",
-    "dataset/diets.csv",
-    "dataset/workout_df.csv",
-    "dataset/precautions_df.csv",
-    "dataset/Symptom-severity.csv",
-]
-# =================================
+# === Load knowledge base ===
+KB_PATHS = {
+    "training": "dataset/Training.csv",
+    "description": "dataset/description.csv",
+    "medications": "dataset/medications.csv",
+    "diets": "dataset/diets.csv",
+    "workout": "dataset/workout_df.csv",
+    "precautions": "dataset/precautions_df.csv",
+    "severity": "dataset/Symptom-severity.csv"
+}
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def load_csv(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return [row for row in reader]
 
-# ============= DATA LOADING =============
+def load_kb():
+    return {
+        k: load_csv(v)
+        for k, v in KB_PATHS.items()
+    }
 
-def load_kb_files(kb_paths):
-    print("[INFO] Loading KB files...")
+KB = load_kb()
 
-    def read_csv(path):
-        with open(path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            data = []
-            for row in reader:
-                if not isinstance(row, dict):
-                    try:
-                        row = dict(zip(reader.fieldnames, list(row)))
-                    except Exception:
-                        continue
-                data.append(row)
-            return data
+# === Conversation states ===
+ASK_GUESS, ASK_CERTAINTY, ASK_SYMPTOMS, ASK_SEVERITY, DIAGNOSIS = range(5)
 
-    (
-        training_path,
-        symptoms_path,
-        desc_path,
-        meds_path,
-        diets_path,
-        workouts_path,
-        precautions_path,
-        severity_path,
-    ) = kb_paths
-
-    training_data = read_csv(training_path)
-    symptoms_df = read_csv(symptoms_path)
-    desc_df = read_csv(desc_path)
-    meds_df = read_csv(meds_path)
-    diets_df = read_csv(diets_path)
-    workouts_df = read_csv(workouts_path)
-    precautions_df = read_csv(precautions_path)
-    severity_df = read_csv(severity_path)
-
-    # --- Normalize diets if stored as list strings ---
-    for row in diets_df:
-        for k, v in list(row.items()):
-            if isinstance(v, str) and v.startswith("[") and v.endswith("]"):
-                try:
-                    items = ast.literal_eval(v)
-                    if isinstance(items, list):
-                        row[k] = ", ".join(items)
-                except Exception:
-                    pass
-
-    print("[INFO] All KB files loaded successfully.")
-    return (
-        training_data,
-        symptoms_df,
-        desc_df,
-        meds_df,
-        diets_df,
-        workouts_df,
-        precautions_df,
-        severity_df,
-    )
-
-# Load knowledge base on startup
-(
-    TRAINING_DATA,
-    SYMPTOM_DF,
-    DESC_DF,
-    MEDS_DF,
-    DIETS_DF,
-    WORKOUT_DF,
-    PRECAUTIONS_DF,
-    SEVERITY_DF,
-) = load_kb_files(KB_PATHS)
-
-# ============= HELPERS =============
-
-def find_disease_by_symptoms(symptoms):
-    scores = {}
-    for row in TRAINING_DATA:
-        disease = row.get("Disease") or row.get("disease")
-        if not disease:
-            continue
-        match_score = 0
-        for s in symptoms:
-            if s in row and row[s] == "1":
-                match_score += 1
-        if match_score > 0:
-            scores[disease] = scores.get(disease, 0) + match_score
-    if not scores:
-        return None
-    return max(scores, key=scores.get)
-
-def get_description(disease):
-    for row in DESC_DF:
-        if row.get("Disease") == disease:
-            return row.get("Description")
-    return "No description available."
-
-def get_medications(disease):
-    return [r.get("medication") for r in MEDS_DF if r.get("Disease") == disease]
-
-def get_diets(disease):
-    return [v for r in DIETS_DF for v in r.values() if disease.lower() in str(v).lower()]
-
-def get_workouts(disease):
-    return [r.get("Workout") for r in WORKOUT_DF if r.get("Disease") == disease]
-
-def get_precautions(disease):
-    recs = []
-    for r in PRECAUTIONS_DF:
-        if r.get("Disease") == disease:
-            for k, v in r.items():
-                if k.startswith("Precaution") and v:
-                    recs.append(v)
-    return recs
-
-def generate_pdf(disease, desc, meds, diets, workouts, precs, user_symptoms):
-    filename = f"Diagnosis_{disease.replace(' ', '_')}.pdf"
-    c = canvas.Canvas(filename, pagesize=A4)
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, 800, f"Diagnosis Report: {disease}")
-    c.setFont("Helvetica", 12)
-    c.drawString(50, 780, f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    c.drawString(50, 760, f"Symptoms Provided: {', '.join(user_symptoms)}")
-
-    text = c.beginText(50, 730)
-    text.setFont("Helvetica", 12)
-    text.textLines([
-        f"\nDescription: {desc}",
-        f"\nMedications: {', '.join(meds) if meds else 'N/A'}",
-        f"\nDiet: {', '.join(diets) if diets else 'N/A'}",
-        f"\nWorkouts: {', '.join(workouts) if workouts else 'N/A'}",
-        f"\nPrecautions: {', '.join(precs) if precs else 'N/A'}",
-        "\n\nDisclaimer: This report is informational only and not medical advice."
-    ])
-    c.drawText(text)
-    c.save()
-    return filename
-
-# ============= BOT LOGIC =============
+user_sessions = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👋 Hello! I’m your Symptom Checker Bot (educational use only).\n\n"
-        "Do you have a disease in mind? (yes/no)"
+    await update.message.reply_text(
+        "👋 Welcome! Let's figure out what might be wrong.\n"
+        "Do you already have a guess about what disease you might have? (yes/no)"
     )
-    context.user_data.clear()
-    await update.message.reply_text(msg)
+    return ASK_GUESS
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
-    data = context.user_data
+async def ask_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower().strip()
+    user_id = update.effective_user.id
+    user_sessions[user_id] = {"guess": None, "certainty": 0, "symptoms": {}, "diagnosis": ""}
 
-    if "step" not in data:
-        if text in ["yes", "y"]:
-            data["step"] = "ask_disease_guess"
-            await update.message.reply_text("What disease do you think you have?")
-        elif text in ["no", "n"]:
-            data["step"] = "ask_symptoms"
-            await update.message.reply_text("Please list your symptoms (comma-separated):")
-        else:
-            await update.message.reply_text("Please reply with 'yes' or 'no'.")
-        return
+    if text.startswith("y"):
+        await update.message.reply_text("What disease do you suspect?")
+        return ASK_CERTAINTY
+    else:
+        await update.message.reply_text("Alright. Please list your symptoms, separated by commas.")
+        return ASK_SYMPTOMS
 
-    # Flow control
-    if data["step"] == "ask_disease_guess":
-        data["disease_guess"] = text
-        data["step"] = "ask_confidence"
-        await update.message.reply_text("How sure are you (0–100%)?")
-        return
+async def ask_certainty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_sessions[user_id]["guess"] = update.message.text.strip()
+    await update.message.reply_text("On a scale of 1–100, how sure are you?")
+    return ASK_SYMPTOMS
 
-    if data["step"] == "ask_confidence":
-        data["confidence"] = text
-        data["step"] = "ask_symptoms"
-        await update.message.reply_text("Now, please list your symptoms (comma-separated):")
-        return
+async def ask_symptoms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    if "certainty" not in user_sessions[user_id]:
+        user_sessions[user_id]["certainty"] = 0
+    symptoms = [s.strip().capitalize() for s in text.split(",")]
+    user_sessions[user_id]["symptoms"] = {s: 0 for s in symptoms}
+    await update.message.reply_text("Rate the severity (1–10) for each symptom one by one.")
+    await update.message.reply_text(f"First: {symptoms[0]}")
+    context.user_data["symptom_list"] = symptoms
+    context.user_data["index"] = 0
+    return ASK_SEVERITY
 
-    if data["step"] == "ask_symptoms":
-        symptoms = [s.strip().lower() for s in text.split(",") if s.strip()]
-        data["symptoms"] = symptoms
-        disease = find_disease_by_symptoms(symptoms)
-        if not disease:
-            await update.message.reply_text("Sorry, I couldn't identify a matching disease.")
-            return
+async def ask_severity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    severity = update.message.text.strip()
+    if not severity.isdigit():
+        await update.message.reply_text("Please enter a number (1–10).")
+        return ASK_SEVERITY
+    severity = int(severity)
 
-        desc = get_description(disease)
-        meds = get_medications(disease)
-        diets = get_diets(disease)
-        workouts = get_workouts(disease)
-        precs = get_precautions(disease)
+    symptoms = context.user_data["symptom_list"]
+    idx = context.user_data["index"]
+    user_sessions[user_id]["symptoms"][symptoms[idx]] = severity
 
-        result = (
-            f"🩺 *Predicted Disease:* {disease}\n\n"
-            f"🧾 *Description:* {desc}\n\n"
-            f"💊 *Medications:* {', '.join(meds) if meds else 'N/A'}\n"
-            f"🥗 *Diet:* {', '.join(diets) if diets else 'N/A'}\n"
-            f"🏃 *Workouts:* {', '.join(workouts) if workouts else 'N/A'}\n"
-            f"⚠️ *Precautions:* {', '.join(precs) if precs else 'N/A'}\n\n"
-            f"Would you like me to generate a PDF report? (yes/no)"
-        )
+    idx += 1
+    if idx < len(symptoms):
+        context.user_data["index"] = idx
+        await update.message.reply_text(f"Next: {symptoms[idx]}")
+        return ASK_SEVERITY
+    else:
+        await update.message.reply_text("Analyzing your symptoms...")
+        disease = infer_disease(user_sessions[user_id]["symptoms"])
+        user_sessions[user_id]["diagnosis"] = disease
+        await send_diagnosis(update, user_id)
+        return ConversationHandler.END
 
-        data.update({
-            "predicted_disease": disease,
-            "desc": desc,
-            "meds": meds,
-            "diets": diets,
-            "workouts": workouts,
-            "precs": precs,
-        })
-        data["step"] = "ask_pdf"
-        await update.message.reply_text(result, parse_mode=ParseMode.MARKDOWN)
-        return
+def infer_disease(symptoms):
+    # Simple rule-based mock-up; replace with actual model logic
+    if "fever" in [s.lower() for s in symptoms]:
+        return "Malaria"
+    elif "cough" in [s.lower() for s in symptoms]:
+        return "Flu"
+    else:
+        return "Unknown condition"
 
-    if data["step"] == "ask_pdf":
-        if text in ["yes", "y"]:
-            pdf_path = generate_pdf(
-                data["predicted_disease"], data["desc"],
-                data["meds"], data["diets"],
-                data["workouts"], data["precs"],
-                data.get("symptoms", [])
-            )
-            await update.message.reply_document(InputFile(pdf_path))
-            os.remove(pdf_path)
-        else:
-            await update.message.reply_text("Okay! No PDF generated.")
-        data.clear()
-        await update.message.reply_text("Would you like to check another case? (yes/no)")
+async def send_diagnosis(update: Update, user_id):
+    diagnosis = user_sessions[user_id]["diagnosis"]
 
-# ============= MAIN =============
+    desc = next((d["Description"] for d in KB["description"] if d["Disease"].lower() == diagnosis.lower()), "No description available.")
+    meds = [d["medication"] for d in KB["medications"] if d["Disease"].lower() == diagnosis.lower()]
+    diets = []
+    for d in KB["diets"]:
+        if d["Disease"].lower() == diagnosis.lower():
+            for v in d.values():
+                if v and "Diet" not in v:
+                    diets.append(v)
+    workouts = [d["Workout"] for d in KB["workout"] if d["Disease"].lower() == diagnosis.lower()]
+    precautions = []
+    for p in KB["precautions"]:
+        if p["Disease"].lower() == diagnosis.lower():
+            for k, v in p.items():
+                if k != "Disease" and v:
+                    precautions.append(v)
+
+    message = (
+        f"🩺 *Diagnosis:* {diagnosis}\n\n"
+        f"📖 *Description:* {desc}\n\n"
+        f"💊 *Medications:* {', '.join(meds) if meds else 'N/A'}\n"
+        f"🥗 *Diet:* {', '.join(diets) if diets else 'N/A'}\n"
+        f"🏋️ *Workouts:* {', '.join(workouts) if workouts else 'N/A'}\n"
+        f"⚠️ *Precautions:* {', '.join(precautions) if precautions else 'N/A'}\n"
+    )
+
+    await update.message.reply_text(message, parse_mode="Markdown")
+    await update.message.reply_text("Would you like a PDF summary? (yes/no)")
+
+async def generate_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if "yes" not in update.message.text.lower():
+        await update.message.reply_text("Alright! Stay healthy. 🌿")
+        return ConversationHandler.END
+
+    diagnosis = user_sessions[user_id]["diagnosis"]
+    now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    pdf_content = f"""
+    Medical Diagnosis Report
+    -------------------------
+    Patient ID: {user_id}
+    Timestamp: {now}
+
+    Diagnosis: {diagnosis}
+    Symptoms: {user_sessions[user_id]["symptoms"]}
+    """
+
+    pdf = BytesIO()
+    pdf.write(pdf_content.encode("utf-8"))
+    pdf.seek(0)
+
+    await update.message.reply_document(InputFile(pdf, filename="diagnosis_report.pdf"))
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Session cancelled. Stay safe!")
+    return ConversationHandler.END
 
 def main():
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("Set TELEGRAM_TOKEN in Render environment variables.")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("🤖 Bot is running...")
+    TOKEN = os.getenv("TELEGRAM_TOKEN")
+    app = Application.builder().token(TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            ASK_GUESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_guess)],
+            ASK_CERTAINTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_certainty)],
+            ASK_SYMPTOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_symptoms)],
+            ASK_SEVERITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_severity)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+
+    app.add_handler(conv)
+    app.add_handler(MessageHandler(filters.Regex("(?i)^yes$"), generate_pdf))
+    app.add_handler(MessageHandler(filters.Regex("(?i)^no$"), cancel))
+
+    print("🤖 Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
