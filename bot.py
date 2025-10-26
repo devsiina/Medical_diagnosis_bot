@@ -8,21 +8,21 @@ Requires:
 - pip install pyTelegramBotAPI reportlab
 
 Expected dataset files (placed in ./dataset/):
-- Training.csv
-- symptoms_df.csv
-- description.csv
-- medications.csv
-- diets.csv
-- workout_df.csv
-- precautions_df.csv
-- Symptom-severity.csv
+ - Training.csv
+ - symptoms_df.csv
+ - description.csv
+ - medications.csv
+ - diets.csv
+ - workout_df.csv
+ - precautions_df.csv
+ - Symptom-severity.csv
 
 This script:
-- Interacts via Telegram messages
-- Handles conversation flow with user states
-- Scores diseases and provides remedies
-- Generates PDF report on request
-- Logs sessions to local_session_logs.csv
+ - Interacts via Telegram messages
+ - Handles conversation flow with user states
+ - Scores diseases and provides remedies
+ - Generates PDF report on request
+ - Logs sessions to local_session_logs.csv
 
 DISCLAIMER: educational/testing only. NOT medical advice.
 
@@ -314,14 +314,15 @@ def ask_next_severity(user_id):
         sym_norm = data.get('symptoms_norm', [])
         ek = emergency_detect(sym_norm, user_guess_norm)
         if ek:
-            bot.send_message(user_id, "Oh no, dear! I noticed something in your symptoms that worries me a lot.")
-            bot.send_message(user_id, f"The mention of '{ek}' sounds serious. If you're feeling chest pain, having trouble breathing, or anything like that, please get help right away from a doctor or emergency services.")
-            bot.send_message(user_id, "Would you still like me to continue with the assessment? It's okay if you'd rather not. [y/n]")
+            bot.send_message(user_id, "⚠️ EMERGENCY WARNING")
+            bot.send_message(user_id, f"I've noticed the term '{ek}' in what you told me — that's a red flag.")
+            bot.send_message(user_id, "If you are having a medical emergency (chest pain, severe difficulty breathing, heavy bleeding, or loss of consciousness), please call emergency services immediately.")
+            bot.send_message(user_id, "Would you like to continue with a non-urgent assessment? Please reply 'yes' to continue or 'no' to stop.")
             user_states[user_id]['state'] = 'confirm_proceed'
         else:
             compute_and_send(user_id)
         return
-    bot.send_message(user_id, f"How severe is your '{symptoms[index]}' on a scale of 1 to 5, where 1 is mild and 5 is really bad?")
+    bot.send_message(user_id, f"On a scale of 1–5, how severe is '{symptoms[index]}'? (1 = mild, 5 = severe)")
     user_states[user_id]['state'] = 'get_severity'
 
 def compute_and_send(user_id):
@@ -336,26 +337,26 @@ def compute_and_send(user_id):
     results = score_all(user_symptoms_norm, severities, disease_map, weights_map, user_guess_norm, float(user_guess_conf or 0))
 
     if not results:
-        bot.send_message(user_id, "I'm sorry, sweetie, I couldn't find any matching conditions in my records. Maybe double-check your symptoms or consult a real doctor?")
+        bot.send_message(user_id, "I couldn't match these symptoms to any condition in my reference data. Please try adding more detail.")
         del user_states[user_id]
         return
 
     # Send analysis results
-    text = "Alright, honey, based on what you've told me, here are the possible conditions I think might fit. Remember, I'm just helping out—please see a doctor for real advice.\n\n"
+    text = "Thanks — here’s what I found based on what you told me:\n\n"
     top = results[:TOP_N]
     for idx, r in enumerate(top, start=1):
-        text += f"{idx}. {safe_title(r['disease'])} — My confidence level: {r['score_percent']}%\n"
+        text += f"{idx}. {safe_title(r['disease'])} — Confidence: {r['score_percent']}%\n"
         if r['guess_boost']:
             gscore, boost_amount = r['guess_boost']
-            text += f"   (Your guess seems to match this one a bit (score {gscore:.2f}), so I gave it a little extra consideration: +{boost_amount} points)\n"
+            text += f"   (Your guess matched this condition (score {gscore:.2f}) → +{boost_amount} pts)\n"
         if r['matches']:
             matches_tr = []
             for m in r['matches']:
                 ds_name, ratio, sev, w = m
-                matches_tr.append(f"{ds_name} (match {int(ratio*100)}%, severity {int(sev)}, weight {w:.2f})")
-            text += "   Symptoms that seem to fit: " + "; ".join(matches_tr) + "\n"
+                matches_tr.append(f"{ds_name} (match {int(ratio*100)}%, sev {int(sev)}, w {w:.2f})")
+            text += "   Matched symptoms: " + "; ".join(matches_tr) + "\n"
         else:
-            text += "   No strong symptom matches, but it could still be possible.\n"
+            text += "   Matched symptoms: none significant\n"
         text += "\n"
 
     bot.send_message(user_id, text)
@@ -370,32 +371,32 @@ def compute_and_send(user_id):
     workout = parse_list_val(workout_map.get(disease_key, ""))
     prec = prec_map.get(disease_key, "")
 
-    detail_text = f"Now, the one that seems most likely to me is {display_name}. Here's what I know about it, dear:\n"
+    detail_text = f"Top suggestion — {display_name}\n"
     if desc:
-        detail_text += "\nA bit about it:\n" + desc + "\n"
+        detail_text += "\nBrief description:\n" + desc + "\n"
     if meds:
-        detail_text += "\nSome suggestions for medications or treatments:\n"
+        detail_text += "\nMedications / Recommendations:\n"
         if isinstance(meds, list):
             detail_text += "\n".join("- " + item for item in meds) + "\n"
         else:
             detail_text += meds + "\n"
     if diet:
-        detail_text += "\nIdeas for your diet to help feel better:\n"
+        detail_text += "\nDiet / Nutrition suggestions:\n"
         if isinstance(diet, list):
             detail_text += "\n".join("- " + item for item in diet) + "\n"
         else:
             detail_text += diet + "\n"
     if workout:
-        detail_text += "\nGentle exercises that might help:\n"
+        detail_text += "\nWorkout / Exercise suggestions:\n"
         if isinstance(workout, list):
             detail_text += "\n".join("- " + item for item in workout) + "\n"
         else:
             detail_text += workout + "\n"
     if prec:
-        detail_text += "\nThings to be careful about or ways to prevent it:\n" + prec + "\n"
+        detail_text += "\nPrecautions / Preventive measures:\n" + prec + "\n"
     if not any((desc, meds, diet, workout, prec)):
-        detail_text += "\nI don't have much more info on this one, I'm afraid.\n"
-    detail_text += "\nPlease take care of yourself, and remember this is just from my little database—always check with a professional nurse or doctor for your health.\n"
+        detail_text += "\nNo additional info found in the dataset for this condition.\n"
+    detail_text += "\nNote: Information shown is from your dataset. This is educational only and not a substitute for professional medical advice.\n"
 
     bot.send_message(user_id, detail_text)
 
@@ -426,7 +427,7 @@ def compute_and_send(user_id):
     }
 
     # Ask for PDF
-    bot.send_message(user_id, "Would you like me to put this into a nice PDF report for you to keep or show your doctor? [y/n]")
+    bot.send_message(user_id, "Would you like a brief PDF summary of this assessment? Reply 'yes' or 'no'.")
     user_states[user_id]['state'] = 'ask_pdf'
 
 def generate_pdf_and_send(user_id):
@@ -434,9 +435,9 @@ def generate_pdf_and_send(user_id):
     pdf_file = f"diagnosis_{user_id}.pdf"
     c = canvas.Canvas(pdf_file, pagesize=letter)
     y = 750
-    c.drawString(100, y, "Your Health Report")
+    c.drawString(100, y, "Diagnosis Report")
     y -= 20
-    c.drawString(100, y, f"Possible Condition: {results['display_name']}")
+    c.drawString(100, y, f"Disease: {results['display_name']}")
     y -= 30
 
     if results['desc']:
@@ -507,44 +508,44 @@ def generate_pdf_and_send(user_id):
                 c.showPage()
                 y = 750
 
-    c.drawString(100, 50, "Remember, dear, this is just for information—please see a doctor!")
+    c.drawString(100, 50, "Note: This is educational only — not a substitute for professional care.")
     c.save()
 
     with open(pdf_file, 'rb') as f:
         bot.send_document(user_id, f)
     os.remove(pdf_file)
-    bot.send_message(user_id, "Here's your report, sweetie. Take good care of yourself!")
+    bot.send_message(user_id, "I've sent the PDF summary. If you need anything else, say 'hi' or use /start.")
     del user_states[user_id]
 
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.chat.id
-    bot.send_message(user_id, "Hello there, dear! I'm Nurse Bot, here to help you figure out what might be going on with your health. But remember, I'm not a real doctor—this is just for learning and testing. Always talk to a professional for real medical advice.")
-    bot.send_message(user_id, "Do you have an idea what might be causing your symptoms? [y/n]")
+    bot.send_message(user_id, "Hello — I'm *HealtXplore Bot*. I'm here to listen to your symptoms and help point you toward possible causes. This is educational only and not medical advice.")
+    bot.send_message(user_id, "Do you have a hunch about a condition? (yes/no)")
     user_states[user_id] = {'state': 'ask_guess', 'data': {}}
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     user_id = message.chat.id
     if user_id not in user_states:
-        bot.send_message(user_id, "Oh, let's start fresh! Use /start to begin our chat.")
+        bot.send_message(user_id, "Please start by sending /start so I can help you.")
         return
     state = user_states[user_id]['state']
     text = message.text.strip().lower()
 
     if state == 'ask_guess':
         if text in ('y', 'yes'):
-            bot.send_message(user_id, "Okay, sweetie, what's your guess for the condition?")
+            bot.send_message(user_id, "Okay — please tell me which condition you suspect.")
             user_states[user_id]['state'] = 'get_guess_name'
         elif text in ('n', 'no'):
-            bot.send_message(user_id, "No worries! Tell me about your symptoms, separated by commas. Like: fever, cough, headache")
+            bot.send_message(user_id, "No problem. Please list your symptoms, separated by commas (e.g., fever, cough, headache).")
             user_states[user_id]['state'] = 'get_symptoms'
         else:
-            bot.send_message(user_id, "Just let me know with y or n, dear.")
+            bot.send_message(user_id, "Please reply with 'yes' or 'no' so I know how to proceed.")
 
     elif state == 'get_guess_name':
         user_states[user_id]['data']['guess'] = message.text.strip()
-        bot.send_message(user_id, "How confident are you in that guess, on a scale from 0 to 100?")
+        bot.send_message(user_id, "On a scale from 0 to 100, how certain are you about that guess?")
         user_states[user_id]['state'] = 'get_guess_conf'
 
     elif state == 'get_guess_conf':
@@ -552,24 +553,24 @@ def handle_message(message):
             conf = float(message.text.strip())
             if 0 <= conf <= 100:
                 user_states[user_id]['data']['conf'] = conf
-                bot.send_message(user_id, "Got it. Now, tell me about your symptoms, separated by commas. For example: fever, cough, headache")
+                bot.send_message(user_id, "Thanks. Now, please list your symptoms (comma-separated).")
                 user_states[user_id]['state'] = 'get_symptoms'
             else:
                 raise ValueError
         except:
-            bot.send_message(user_id, "Please give me a number between 0 and 100, honey.")
+            bot.send_message(user_id, "Please enter a number between 0 and 100 to indicate your certainty.")
 
     elif state == 'get_symptoms':
         raw = message.text.strip()
         symptoms = [s.strip() for s in re.split(r",|;|\n", raw) if s.strip()]
         if not symptoms:
-            bot.send_message(user_id, "I need at least one symptom to help you, dear. Try again?")
+            bot.send_message(user_id, "I need at least one symptom to help — could you enter them again?")
             return
         user_states[user_id]['data']['symptoms'] = symptoms
         user_states[user_id]['data']['symptoms_norm'] = [normalize(s) for s in symptoms]
         user_states[user_id]['data']['severities'] = []
         user_states[user_id]['current_severity_index'] = 0
-        bot.send_message(user_id, "Thank you for sharing. Now, let's talk about how bad each one is, okay?")
+        bot.send_message(user_id, "For each symptom, tell me how severe it is from 1 (mild) to 5 (severe).")
         ask_next_severity(user_id)
 
     elif state == 'get_severity':
@@ -582,25 +583,27 @@ def handle_message(message):
             else:
                 raise ValueError
         except:
-            bot.send_message(user_id, "Just a number from 1 to 5, please, sweetie.")
+            bot.send_message(user_id, "Please enter a number between 1 and 5 for severity.")
 
     elif state == 'confirm_proceed':
         if text in ('y', 'yes'):
+            bot.send_message(user_id, "Alright — I will continue, but please seek urgent care if symptoms worsen.")
             compute_and_send(user_id)
         elif text in ('n', 'no'):
-            bot.send_message(user_id, "That's wise, dear. Please take care and get professional help soon.")
+            bot.send_message(user_id, "Understood. Please seek immediate help if conditions worsen. Take care.")
             del user_states[user_id]
         else:
-            bot.send_message(user_id, "y or n, if you can, honey.")
+            bot.send_message(user_id, "Please reply 'yes' to continue the non-urgent assessment or 'no' to stop and seek help.")
 
     elif state == 'ask_pdf':
         if text in ('y', 'yes'):
+            bot.send_message(user_id, "I'll prepare your PDF summary and send it shortly.")
             generate_pdf_and_send(user_id)
         elif text in ('n', 'no'):
-            bot.send_message(user_id, "Alright, take care of yourself, dear!")
+            bot.send_message(user_id, "Alright — no PDF. If you need more help later, send /start.")
             del user_states[user_id]
         else:
-            bot.send_message(user_id, "Just y or n, please.")
+            bot.send_message(user_id, "Please reply with 'yes' or 'no'.")
 
 if __name__ == "__main__":
     print("Loading datasets from:", DATA_DIR)
